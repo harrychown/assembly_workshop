@@ -1,0 +1,158 @@
+#!/bin/bash
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=10:mem=60gb
+#PBS -N zASM_WORKSHOP
+
+eval "$(~/anaconda3/bin/conda shell.bash hook)"
+PREFIX=demo
+R1=$(echo "/rds/general/user/hchown/projects/fisher-aspergillus-analysis/live/harry/demo_data/${PREFIX}_1.fastq.gz" )
+R2=$(echo "/rds/general/user/hchown/projects/fisher-aspergillus-analysis/live/harry/demo_data/${PREFIX}_2.fastq.gz" )
+REFERENCE=/rds/general/user/hchown/projects/fisher-aspergillus-reference/live/GCF_000002655.1_ASM265v1_genomic.fa
+SCAFFOLD_REF=/rds/general/user/hchown/projects/fisher-aspergillus-reference/live/CEA10.fasta
+REF_MT=/rds/general/user/hchown/projects/fisher-aspergillus-reference/live/NC_017016.1_mito.fa
+OUTDIR=/rds/general/user/hchown/projects/fisher-aspergillus-analysis/live/harry/demo_data/asm_workshop/demo
+PROTEIN=/rds/general/user/hchown/projects/fisher-aspergillus-analysis/live/harry/demo_data/
+NSLOTS=10
+
+mkdir -p $OUTDIR
+cd $TMPDIR
+#### QUALITY CONTROL READS ####
+# Assess read quality - fastqc
+conda activate fastqc
+fastqc -o $OUTDIR $R1
+fastqc -o $OUTDIR $R2
+
+# Trimming and quality filtering - fastp
+conda activate fastp
+fastp -i $R1  -I $R2  -o $OUTDIR/${PREFIX}_1.trimmed.fastq.gz  -O $OUTDIR/${PREFIX}_2.trimmed.fastq.gz
+
+
+# Re-assess trimmed quality - fastqc
+conda activate fastqc
+fastqc -o $OUTDIR $OUTDIR/${PREFIX}_1.trimmed.fastq.gz 
+fastqc -o $OUTDIR $OUTDIR/${PREFIX}_2.trimmed.fastq.gz 
+
+# Extract mitochondria
+conda activate getorganelle
+mkdir -p $OUTDIR/mitochondria
+get_organelle_config.py --add fungus_mt
+get_organelle_from_reads.py -1 $OUTDIR/${PREFIX}_1.trimmed.fastq.gz  -2 $OUTDIR/${PREFIX}_2.trimmed.fastq.gz  -t 1 -k 21,45,65,85,105 -o $OUTDIR/mitochondria -F fungus_mt -R 10 -s /rds/general/user/hchown/projects/fisher-aspergillus-reference/live/NC_017016.1_mito.fa --overwrite --reduce-reads-for-coverage inf --max-reads inf
+END
+
+# Read mapping function
+mapReads () {
+	# 1 - reference
+	# 2 - read1
+	# 3 - read2
+	# 4 - prefix
+	# 5 - outdir
+
+	# Initial mapping
+	conda activate bwa
+	bwa index $1
+	bwa mem -t 1 $1 $2 $3 > $4.sam
+	# Reformatting
+	conda activate samtools
+	samtools view -bS $4.sam > $4.bam
+	samtools sort $4.bam -o $4.sorted.bam
+	samtools index $4.sorted.bam
+	# Calculate coverage
+	conda activate qualimap
+	qualimap bamqc -nt 1 -bam $4.sorted.bam -outdir $5
+	mv $4.sorted.bam $5
+}
+
+# Check coverage for mitochondria
+mkdir -p "$OUTDIR/ref_mit_mapping"
+mapReads $REF_MT $OUTDIR/${PREFIX}_1.trimmed.fastq.gz $OUTDIR/${PREFIX}_2.trimmed.fastq.gz $PREFIX.ref_mit $OUTDIR/ref_mit_mapping
+
+# Check coverage for nuclear genome
+mkdir -p "$OUTDIR/ref_mapping"
+mapReads $REFERENCE $OUTDIR/${PREFIX}_1.trimmed.fastq.gz $OUTDIR/${PREFIX}_2.trimmed.fastq.gz $PREFIX.ref $OUTDIR/ref_mapping
+
+# Remove mitochondrial reads
+mkdir -p "$OUTDIR/mit_mapping"
+mapReads $OUTDIR/mitochondria/fungus_mt.K85.complete.graph1.1.path_sequence.fasta $OUTDIR/${PREFIX}_1.trimmed.fastq.gz $OUTDIR/${PREFIX}_2.trimmed.fastq.gz $PREFIX.mit .
+
+# Extract mapped reads
+conda activate samtools
+samtools view -b -f 4 $PREFIX.mit.sorted.bam > $PREFIX.mit.unmapped.bam
+samtools sort -n -o $PREFIX.nucl.qsort.bam $PREFIX.mit.unmapped.bam
+# Convert to fastq
+conda activate bedtools
+bedtools bamtofastq -i $PREFIX.nucl.qsort.bam -fq "${PREFIX}_1.nuclear.fastq" -fq2 "${PREFIX}_2.nuclear.fastq"
+gzip "${PREFIX}_1.nuclear.fastq" "${PREFIX}_2.nuclear.fastq"
+mv *.nuclear.fastq.gz $OUTDIR
+#### ASSEMBLY ####
+# Inital assembly - SPAdes
+mkdir -p $OUTDIR/spades
+conda activate spades
+spades.py -1 "$OUTDIR/${PREFIX}_1.nuclear.fastq.gz" -2 "$OUTDIR/${PREFIX}_2.nuclear.fastq.gz" -o $OUTDIR/spades --threads 10 --careful
+# Extract contamination - AAFTF Sourpurge step
+conda activate aaftf
+export AAFTF_DB=/rds/general/user/hchown/projects/fisher-local-software/live/AAFTF_DB
+AAFTF sourpurge -i $OUTDIR/spades/scaffolds.fasta -p Ascomycota -o $OUTDIR/scaffolds.cleaned.fasta
+
+# Polishing - bwa, samtools, pilon
+
+mapReads $OUTDIR/scaffolds.cleaned.fasta "$OUTDIR/${PREFIX}_1.nuclear.fastq.gz" "$OUTDIR/${PREFIX}_2.nuclear.fastq.gz" $PREFIX.self_map .
+# Polish
+conda activate pilon
+pilon --genome $OUTDIR/scaffolds.cleaned.fasta --bam $PREFIX.self_map.sorted.bam --output $OUTDIR/$PREFIX.pilon_r1 -Xmx60G --threads $NSLOTS
+
+
+# Scaffold
+conda activate ragtag
+mkdir -p $OUTDIR/ragtag
+ragtag.py scaffold $SCAFFOLD_REF $OUTDIR/$PREFIX.pilon_r1.fasta -u -o $OUTDIR/ragtag -t 10 -r
+
+# Polish on scaffold
+mapReads $OUTDIR/ragtag/ragtag.scaffold.fasta "$OUTDIR/${PREFIX}_1.nuclear.fastq.gz" "$OUTDIR/${PREFIX}_2.nuclear.fastq.gz" $PREFIX.scaffold_map .
+conda activate pilon
+pilon --genome $OUTDIR/ragtag/ragtag.scaffold.fasta --bam $PREFIX.scaffold_map.sorted.bam --output $PREFIX.pilon_r2 -Xmx60G --threads $NSLOTS
+
+
+#### ASSEMBLY QC ####
+conda activate quast
+mkdir -p $OUTDIR/quast
+quast -m 0 --fungus -r $SCAFFOLD_REF -o $OUTDIR/quast $PREFIX.pilon_r2.fasta
+
+### BUSCO ####
+conda activate busco
+busco -m genome -i $PREFIX.pilon_r2.fasta -o busco --out_path $OUTDIR --miniprot -l eurotiales_odb10 --download_path /rds/general/user/hchown/projects/fisher-local-db/live/busco-downloads -f -c $NSLOTS
+
+
+#### ANNOTATION ####
+# Using existing pangenome annotations - miniprot
+#### MINIPROT ####
+# Map protein-to-genome
+conda activate busco
+miniprot -t $NSLOTS --trans -I $PREFIX.pilon_r2.fasta $PROTEIN > $PREFIX.miniprot.faa
+miniprot -t $NSLOTS --gff -I $PREFIX.pilon_r2.fasta $PROTEIN > $PREFIX.miniprot.tmp
+# Update ID with target
+sed -E 's/Parent=[^;]+;(.*)Target=([^ ;]+)(.*)/Parent=\2;\1Target=\2\3/' $PREFIX.miniprot.tmp \
+| sed -E 's/ID=[^;]+;(.*)Target=([^ ;]+)(.*)/ID=\2;\1Target=\2\3/' > $PREFIX.miniprot.gff
+# Extract spliced transcripts
+conda activate agat
+agat_sp_extract_sequences.pl --gff $PREFIX.miniprot.gff --fasta $PREFIX.pilon_r2.fasta -t cds -o $PREFIX.agat.fasta
+# Linearise
+conda activate seqkit
+seqkit seq -w 0 $PREFIX.agat.fasta >  $PREFIX.agat.linear.fasta
+
+
+# De novo - braker3
+# Align RNAseq data
+hisat2-build ./final_mask/${PREFIX}/${PREFIX}.unmasked.fasta.masked.masked ./rna_align/$PREFIX/$PREFIX.hisat2.idx
+hisat2 --dta -t -p $NSLOTS --max-intronlen 50000 -x ./rna_align/$PREFIX/$PREFIX.hisat2.idx -U $RNAFILE -S ./rna_align/$PREFIX/$PREFIX.$COUNTER.sam
+
+conda activate samtools
+samtools view -@ $NSLOTS -b -o ./rna_align/$PREFIX/$PREFIX.$COUNTER.bam ./rna_align/$PREFIX/$PREFIX.$COUNTER.sam
+samtools sort -@ $NSLOTS -o ./rna_align/$PREFIX/$PREFIX.$COUNTER.sorted.bam ./rna_align/$PREFIX/$PREFIX.$COUNTER.bam
+samtools index -@ $NSLOTS ./rna_align/$PREFIX/$PREFIX.$COUNTER.sorted.bam
+export AUGUSTUS_CONFIG_PATH=./
+EXAMPLE=/rds/general/user/hchown/projects/fisher-local-software/live/BRAKER/example
+BRAKER_SIF=/rds/general/user/hchown/projects/fisher-local-software/live/braker3.sif
+
+singularity exec -B ${PWD}:${PWD} ${BRAKER_SIF} braker.pl --genome=${EXAMPLE}/genome.fa --bam=${EXAMPLE}/RNAseq.bam --workingdir=${wd} --GENEMARK_PATH=${ETP}/gmes --threads 8 --gm_max_intergenic 10000 --skipOptimize --busco_lineage eukaryota_odb10 &> test1.log
+
+
